@@ -2,7 +2,7 @@
 header("Access-Control-Allow-Origin: *");
 header("Content-Type: application/json");
 
-$conn = new mysqli("localhost", "root", "", "electricity_system");
+$conn = new mysqli("localhost", "root", "", "tenant_power_control");
 
 $result = $conn->query("SELECT tenant_id, current_kw, status FROM tenant_power");
 
