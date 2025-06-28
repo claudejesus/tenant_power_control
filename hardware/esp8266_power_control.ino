@@ -1,84 +1,129 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
 
-// WiFi Credentials
+// WiFi credentials
 const char* ssid = "jesus";
 const char* password = "jesus1234";
 
-// API Endpoint
-const char* apiUrl = "http://192.168.1.104/tenant_power_control_system/backend/hardware_api.php";
+// API endpoints
+const char* apiURL_GET = "http://192.168.1.102/tenant_power_control_system/backend/api_get_power.php";
+const char* apiURL_POST = "http://192.168.1.102/tenant_power_control_system/backend/hardware_api.php";
 
-// Relay Pins for each tenant
-const int relayPins[3] = {5, 18, 19};  // GPIO5, GPIO18, GPIO19
+// Tenant settings
+struct Tenant {
+  int id;
+  int relayPin;
+  int ledPin;
+  int currentPin;
+  int voltagePin;
+  float current_kw;
+};
 
-// Sensor Pins (ADC)
-const int sensorPins[3] = {34, 35, 32}; // GPIO34, GPIO35, GPIO32
+Tenant tenants[] = {
+  {1, 18, 15, 13, 34, 0.0},  // Tenant 1
+  {2, 19, 2, 35, 5, 0.0}     // Tenant 2
+};
 
-// Tenant IDs
-const int tenantIds[3] = {1, 2, 3};
+const int tenantCount = sizeof(tenants) / sizeof(tenants[0]);
 
 void setup() {
   Serial.begin(115200);
 
-  // Setup relays
-  for (int i = 0; i < 3; i++) {
-    pinMode(relayPins[i], OUTPUT);
-    digitalWrite(relayPins[i], LOW);
-  }
-
-  // Connect WiFi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
+    delay(500);
     Serial.print(".");
   }
-  Serial.println("\nConnected to WiFi!");
+  Serial.println("\nConnected!");
+
+  for (int i = 0; i < tenantCount; i++) {
+    pinMode(tenants[i].relayPin, OUTPUT);
+    pinMode(tenants[i].ledPin, OUTPUT);
+    digitalWrite(tenants[i].relayPin, HIGH); // Relay ON
+    digitalWrite(tenants[i].ledPin, LOW);    // LED OFF
+  }
 }
 
 void loop() {
-  for (int i = 0; i < 3; i++) {
-    int sensorValue = analogRead(sensorPins[i]);  // 0–4095 on ESP32
-    float voltage = sensorValue * (3.3 / 4095.0);
-    float current = voltage; // Placeholder — use real formula if needed
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(String(apiURL_GET));
+    int code = http.GET();
 
-    String status;
-    if (current < 0.1) {
-      digitalWrite(relayPins[i], LOW);
-      status = "disconnected";
-    } else {
-      digitalWrite(relayPins[i], HIGH);
-      status = "connected";
-    }
+    if (code == 200) {
+      String payload = http.getString();
+      Serial.println("GET Payload: " + payload);
 
-    if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
-      http.begin(apiUrl);
-      http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+      DynamicJsonDocument doc(2048);
+      DeserializationError error = deserializeJson(doc, payload);
 
-      String postData = "tenant_id=" + String(tenantIds[i]) +
-                        "&status=" + status +
-                        "&current_kw=" + String(current, 3);
+      if (!error) {
+        JsonArray arr = doc.as<JsonArray>();
 
-      Serial.print("Tenant ");
-      Serial.print(tenantIds[i]);
-      Serial.print(" → Current: ");
-      Serial.print(current);
-      Serial.print(" kW → Status: ");
-      Serial.println(status);
+        for (int i = 0; i < tenantCount; i++) {
+          for (JsonObject obj : arr) {
+            if (obj["tenant_id"] == tenants[i].id) {
+              tenants[i].current_kw = obj["current_kw"];
+              break;
+            }
+          }
 
-      int httpCode = http.POST(postData);
-      if (httpCode > 0) {
-        String response = http.getString();
-        Serial.print("Response: ");
-        Serial.println(response);
+          // Read sensors
+          float rawCurrent = analogRead(tenants[i].currentPin);
+          float rawVoltage = analogRead(tenants[i].voltagePin);
+          float current = rawCurrent * (3.3 / 4095.0); // placeholder
+          float voltage = rawVoltage * (3.3 / 4095.0); // placeholder
+          float powerUsed = voltage * current;
+
+          Serial.printf("Tenant %d → V: %.2f V, I: %.2f A, P: %.2f kW\n", tenants[i].id, voltage, current, powerUsed);
+
+          // Update usage
+          if (tenants[i].current_kw > 0) {
+            tenants[i].current_kw -= powerUsed;
+            if (tenants[i].current_kw < 0) tenants[i].current_kw = 0;
+            sendUsageUpdate(tenants[i].id, powerUsed);
+          }
+
+          // Relay and LED control
+          if (tenants[i].current_kw <= 0) {
+            digitalWrite(tenants[i].relayPin, LOW); // Cut power
+            digitalWrite(tenants[i].ledPin, HIGH);  // LED ON (disconnected)
+            Serial.printf("Relay OFF for Tenant %d\n", tenants[i].id);
+          } else {
+            digitalWrite(tenants[i].relayPin, HIGH); // Power ON
+            digitalWrite(tenants[i].ledPin, LOW);    // LED OFF
+            Serial.printf("Relay ON for Tenant %d\n", tenants[i].id);
+          }
+
+          delay(1000); // short delay between tenants
+        }
+
       } else {
-        Serial.println("Failed to POST");
+        Serial.println("JSON Parse Error!");
       }
-      http.end();
+    } else {
+      Serial.printf("GET error: %d\n", code);
     }
-    delay(1000); // Short delay between tenant updates
+    http.end();
+  } else {
+    Serial.println("WiFi disconnected.");
   }
 
-  delay(5000); // Wait before the next cycle
+  delay(5000);
+}
+
+void sendUsageUpdate(int tenantId, float usedKw) {
+  HTTPClient http;
+  http.begin(apiURL_POST);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData = "tenant_id=" + String(tenantId) + "&used_kw=" + String(usedKw, 3);
+  int httpCode = http.POST(postData);
+  String response = http.getString();
+
+  Serial.printf("POST tenant %d (%.2f kW) → Code: %d, Response: %s\n", tenantId, usedKw, httpCode, response.c_str());
+
+  http.end();
 }
